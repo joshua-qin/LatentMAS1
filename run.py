@@ -106,6 +106,8 @@ def main():
     parser.add_argument("--text_mas_context_length", type=int, default=-1, help="TextMAS context length limit")
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
+    parser.add_argument("--hierarchical_fixed", action="store_true",
+                        help="LatentMAS hierarchical: non-judger agents reason independently (no shared KV); judger sees fused caches. No ROPE fix in this mode.")
     parser.add_argument("--seed", type=int, default=42)
 
     # vLLM support
@@ -117,7 +119,15 @@ def main():
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9, help="Target GPU memory utilization for vLLM")
 
     args = parser.parse_args()
-    
+
+    # vllm optional: disable if not installed
+    if args.use_vllm:
+        try:
+            import vllm  # noqa: F401
+        except ImportError:
+            args.use_vllm = False
+            print("Warning: --use_vllm set but vllm not installed; using HuggingFace backend.")
+
     if args.method == "latent_mas" and args.use_vllm:
         args.use_second_HF_model = True 
         args.enable_prefix_caching = True

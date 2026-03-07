@@ -6,7 +6,13 @@ from prompts import build_agent_message_sequential_latent_mas, build_agent_messa
 from utils import extract_gsm8k_answer, normalize_answer, extract_markdown_python_block, run_with_timeout
 import torch
 import argparse
-from vllm import SamplingParams
+# vllm optional: only needed when using --use_vllm
+try:
+    from vllm import SamplingParams
+    _HAS_VLLM = True
+except ImportError:
+    SamplingParams = None
+    _HAS_VLLM = False
 import pdb
 
 try:
@@ -43,11 +49,15 @@ class LatentMASMethod:
         if self.latent_only:
             self.sequential_info_only = True
 
-        self.sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=args.max_new_tokens,
-        )
+        # Only set when vllm is available (needed for run_batch_vllm / --use_vllm)
+        if _HAS_VLLM and SamplingParams is not None:
+            self.sampling_params = SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=args.max_new_tokens,
+            )
+        else:
+            self.sampling_params = None
         self.task = args.task
 
     @staticmethod
@@ -78,6 +88,35 @@ class LatentMASMethod:
                 trimmed_layers.append(layer)
         return tuple(trimmed_layers)
 
+    @staticmethod
+    def _to_legacy_tuple(past_kv) -> Optional[Tuple]:
+        """Convert cache to legacy (layer, (key, value)) tuple for fusion. No ROPE handling."""
+        if past_kv is None:
+            return None
+        if Cache is not None and isinstance(past_kv, Cache):
+            return past_kv.to_legacy_cache()
+        return past_kv
+
+    @staticmethod
+    def _fuse_past_key_values(cache_list: List) -> Optional[Tuple]:
+        """Fuse multiple KV caches by concatenating along sequence dim. Returns legacy tuple. No ROPE fix."""
+        if not cache_list or all(c is None for c in cache_list):
+            return None
+        legacies = [LatentMASMethod._to_legacy_tuple(c) for c in cache_list if c is not None]
+        if not legacies:
+            return None
+        if len(legacies) == 1:
+            return legacies[0]
+        num_layers = len(legacies[0])
+        fused = []
+        for layer_idx in range(num_layers):
+            keys = [leg[layer_idx][0] for leg in legacies]
+            values = [leg[layer_idx][1] for leg in legacies]
+            fused_k = torch.cat(keys, dim=-2)
+            fused_v = torch.cat(values, dim=-2)
+            fused.append((fused_k, fused_v))
+        return tuple(fused)
+
     @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:
         if len(items) > self.generate_bs:
@@ -85,8 +124,10 @@ class LatentMASMethod:
 
         batch_size = len(items)
         past_kv: Optional[Tuple] = None
+        non_judger_caches: List = []  # used only when hierarchical_fixed: one cache per non-judger agent
         agent_traces: List[List[Dict]] = [[] for _ in range(batch_size)]
         final_texts = ["" for _ in range(batch_size)]
+        hierarchical_fixed = bool(getattr(self.args, "hierarchical_fixed", False)) and self.args.prompt == "hierarchical"
 
         for agent in self.agents:
 
@@ -107,7 +148,9 @@ class LatentMASMethod:
             )
 
             if agent.role != "judger":
-                prev_past_len = _past_length(past_kv)
+                # Faithful hierarchical: each non-judger agent reasons independently (no shared KV)
+                past_kv_input = None if hierarchical_fixed else past_kv
+                prev_past_len = _past_length(past_kv_input)
 
                 if self.args.think:
                         wrapped_prompts = [f"{prompt}<think>" for prompt in prompts]
@@ -131,9 +174,11 @@ class LatentMASMethod:
                     wrapped_ids,
                     attention_mask=wrapped_mask,
                     latent_steps=self.latent_steps,
-                    past_key_values=past_kv,
+                    past_key_values=past_kv_input,
                 )
-                if self.sequential_info_only or self.latent_only:
+                if hierarchical_fixed:
+                    non_judger_caches.append(past_kv)
+                elif self.sequential_info_only or self.latent_only:
                     new_past_len = _past_length(past_kv)
                     tokens_added = new_past_len - prev_past_len
                     tokens_to_keep = self.latent_steps if self.latent_only else tokens_added
@@ -154,8 +199,11 @@ class LatentMASMethod:
                         }
                     )
             else:
-
-                past_for_decoding = past_kv if self.latent_steps > 0 else None
+                # Judger: in hierarchical_fixed mode, use fused caches from independent agents (no ROPE fix yet)
+                if hierarchical_fixed and non_judger_caches:
+                    past_for_decoding = self._fuse_past_key_values(non_judger_caches)
+                else:
+                    past_for_decoding = past_kv if self.latent_steps > 0 else None
 
                 if self.args.think:
                         judger_prompts = [f"{prompt}<think>" for prompt in prompts]
