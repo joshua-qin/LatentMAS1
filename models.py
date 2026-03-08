@@ -37,6 +37,63 @@ def _past_length(past_key_values) -> int:
     return k.shape[-2]
 
 
+# --- RoPE helpers for hierarchical_fixed cache fusion ---
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate half the hidden dims (for RoPE)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _get_rope_config(hf_model) -> Optional[dict]:
+    """Get rope_theta, head_dim, num_heads from model config. Returns None if not found."""
+    config = getattr(hf_model, "config", None)
+    if config is None:
+        return None
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rp = getattr(config, "rope_parameters", None)
+        if isinstance(rp, dict):
+            rope_theta = rp.get("rope_theta", 10000.0)
+        elif rp is not None:
+            rope_theta = getattr(rp, "rope_theta", 10000.0)
+        else:
+            rope_theta = 10000.0
+    num_heads = getattr(config, "num_attention_heads", None)
+    head_dim = getattr(config, "head_dim", None) or (
+        getattr(config, "hidden_size", 0) // num_heads if num_heads else None
+    )
+    if head_dim is None or num_heads is None:
+        return None
+    return {"rope_theta": float(rope_theta), "head_dim": int(head_dim), "num_heads": int(num_heads)}
+
+
+def _rope_cos_sin(key: torch.Tensor, position_start: int, rope_config: dict, device: torch.device, dtype: torch.dtype):
+    """Compute cos/sin for RoPE for positions [position_start, position_start+seq_len). Shape for key [..., seq_len, head_dim]."""
+    seq_len = key.shape[-2]
+    head_dim = rope_config["head_dim"]
+    base = rope_config["rope_theta"]
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+    positions = torch.arange(position_start, position_start + seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)
+    cos = freqs.cos().to(dtype).unsqueeze(0).unsqueeze(0)
+    sin = freqs.sin().to(dtype).unsqueeze(0).unsqueeze(0)
+    # expand to [1, 1, seq_len, head_dim] (pairs duplicated for RoPE)
+    cos = torch.cat([cos, cos], dim=-1)
+    sin = torch.cat([sin, sin], dim=-1)
+    return cos, sin
+
+
+def _apply_rotary(key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE to key: key_rot = key * cos + rotate_half(key) * sin."""
+    return (key * cos) + (_rotate_half(key) * sin)
+
+
+def _unapply_rotary(key_rot: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Inverse RoPE: key = key_rot * cos - rotate_half(key_rot) * sin."""
+    return (key_rot * cos) - (_rotate_half(key_rot) * sin)
+
+
 class ModelWrapper:
     def __init__(self, model_name: str, device: torch.device, use_vllm: bool = False, args = None):
         self.model_name = model_name
@@ -276,6 +333,61 @@ class ModelWrapper:
             generations.append(text)
         return generations, outputs.past_key_values
 
+    def unrotate_legacy_cache(self, cache_legacy: Optional[Tuple]) -> Optional[Tuple]:
+        """Unrotate keys in legacy cache (inverse RoPE) so cache can be fused. Keys assumed rotated with positions 0..L-1."""
+        if cache_legacy is None:
+            return None
+        hf_model = self.model if hasattr(self, "model") else getattr(self, "HF_model", None)
+        if hf_model is None:
+            print("[hierarchical_fixed_rope] No HF model available; skipping unrotate (cache returned as-is).")
+            return cache_legacy
+        rope_config = _get_rope_config(hf_model)
+        if rope_config is None:
+            print("[hierarchical_fixed_rope] Could not get RoPE config (rope_theta/head_dim); skipping unrotate (cache returned as-is).")
+            return cache_legacy
+        device = next(hf_model.parameters()).device
+        dtype = next(hf_model.parameters()).dtype
+        out = []
+        try:
+            for k, v in cache_legacy:
+                seq_len = k.shape[-2]
+                cos, sin = _rope_cos_sin(k, 0, rope_config, device, dtype)
+                cos = cos.to(k.device)
+                sin = sin.to(k.device)
+                k_unrot = _unapply_rotary(k.float(), cos, sin).to(k.dtype)
+                out.append((k_unrot, v))
+            return tuple(out)
+        except Exception as e:
+            print(f"[hierarchical_fixed_rope] unrotate_legacy_cache failed: {e}; returning cache as-is.")
+            return cache_legacy
+
+    def rotate_legacy_cache(self, cache_legacy: Optional[Tuple], position_start: int = 0) -> Optional[Tuple]:
+        """Apply RoPE to keys in legacy cache with positions [position_start, ...]. Use after fusing caches."""
+        if cache_legacy is None:
+            return None
+        hf_model = self.model if hasattr(self, "model") else getattr(self, "HF_model", None)
+        if hf_model is None:
+            print("[hierarchical_fixed_rope] No HF model available; skipping rotate (cache returned as-is).")
+            return cache_legacy
+        rope_config = _get_rope_config(hf_model)
+        if rope_config is None:
+            print("[hierarchical_fixed_rope] Could not get RoPE config; skipping rotate (cache returned as-is).")
+            return cache_legacy
+        device = next(hf_model.parameters()).device
+        dtype = next(hf_model.parameters()).dtype
+        out = []
+        try:
+            for k, v in cache_legacy:
+                cos, sin = _rope_cos_sin(k, position_start, rope_config, device, dtype)
+                cos = cos.to(k.device)
+                sin = sin.to(k.device)
+                k_rot = _apply_rotary(k.float(), cos, sin).to(k.dtype)
+                out.append((k_rot, v))
+            return tuple(out)
+        except Exception as e:
+            print(f"[hierarchical_fixed_rope] rotate_legacy_cache failed: {e}; returning cache as-is.")
+            return cache_legacy
+
     def tokenize_text(self, text: str) -> torch.Tensor:
         return self.tokenizer(
             text,
@@ -423,4 +535,3 @@ class ModelWrapper:
             curr_output_embedding.append(latent_embed.detach())
 
         return past, torch.cat(curr_output_embedding, dim=1) # Output input embeddings
-

@@ -16,9 +16,10 @@ except ImportError:
 import pdb
 
 try:
-    from transformers.cache_utils import Cache
+    from transformers.cache_utils import Cache, DynamicCache
 except ImportError:
     Cache = None
+    DynamicCache = None
 
 class LatentMASMethod:
     def __init__(
@@ -68,45 +69,77 @@ class LatentMASMethod:
         start = tensor.shape[-2] - keep
         return tensor[..., start:, :].contiguous()
 
-    def _truncate_past(self, past_kv: Optional[Tuple], tokens_to_keep: int) -> Optional[Tuple]:
+    def _truncate_past(self, past_kv, tokens_to_keep: int):
         if past_kv is None or tokens_to_keep <= 0:
             return None
-        if Cache is not None and isinstance(past_kv, Cache):
-            legacy = past_kv.to_legacy_cache()
-            trimmed_legacy = tuple(
-                tuple(self._slice_tensor(t, tokens_to_keep) for t in layer)
-                for layer in legacy
+
+        legacy = self._to_legacy_tuple(past_kv)
+
+        trimmed_legacy = tuple(
+            (
+                self._slice_tensor(k, tokens_to_keep),
+                self._slice_tensor(v, tokens_to_keep),
             )
-            return past_kv.__class__.from_legacy_cache(trimmed_legacy)
-        trimmed_layers = []
-        for layer in past_kv:
-            if isinstance(layer, tuple):
-                trimmed_layers.append(tuple(self._slice_tensor(t, tokens_to_keep) for t in layer))
-            elif torch.is_tensor(layer):
-                trimmed_layers.append(self._slice_tensor(layer, tokens_to_keep))
-            else:
-                trimmed_layers.append(layer)
-        return tuple(trimmed_layers)
+            for (k, v) in legacy
+        )
+
+        # return same style as input when possible
+        if Cache is not None and isinstance(past_kv, Cache):
+            return self._legacy_to_dynamic_cache(trimmed_legacy)
+        return trimmed_legacy
 
     @staticmethod
     def _to_legacy_tuple(past_kv) -> Optional[Tuple]:
-        """Convert cache to legacy (layer, (key, value)) tuple for fusion. No ROPE handling."""
+        """
+        Convert HF Cache object -> legacy tuple((k, v), ...) for fusion/truncation code.
+        Works with newer DynamicCache API.
+        """
         if past_kv is None:
             return None
+
+        # Already legacy
+        if isinstance(past_kv, tuple):
+            return past_kv
+
+        # Newer HF Cache API
         if Cache is not None and isinstance(past_kv, Cache):
-            return past_kv.to_legacy_cache()
-        return past_kv
+            legacy = []
+            for layer in past_kv.layers:
+                k = layer.keys
+                v = layer.values
+                legacy.append((k, v))
+            return tuple(legacy)
+
+        raise TypeError(f"Unsupported past_kv type: {type(past_kv)}")
+
 
     @staticmethod
-    def _fuse_past_key_values(cache_list: List) -> Optional[Tuple]:
-        """Fuse multiple KV caches by concatenating along sequence dim. Returns legacy tuple. No ROPE fix."""
+    def _legacy_to_dynamic_cache(legacy_kv):
+        """
+        Convert legacy tuple((k, v), ...) back into DynamicCache if available.
+        """
+        if legacy_kv is None:
+            return None
+
+        if DynamicCache is None:
+            return legacy_kv
+
+        cache = DynamicCache()
+        for layer_idx, (k, v) in enumerate(legacy_kv):
+            cache.update(k, v, layer_idx)
+        return cache
+
+    @staticmethod
+    def _fuse_past_key_values(cache_list: List):
         if not cache_list or all(c is None for c in cache_list):
             return None
+
         legacies = [LatentMASMethod._to_legacy_tuple(c) for c in cache_list if c is not None]
         if not legacies:
             return None
         if len(legacies) == 1:
             return legacies[0]
+
         num_layers = len(legacies[0])
         fused = []
         for layer_idx in range(num_layers):
@@ -128,6 +161,9 @@ class LatentMASMethod:
         agent_traces: List[List[Dict]] = [[] for _ in range(batch_size)]
         final_texts = ["" for _ in range(batch_size)]
         hierarchical_fixed = bool(getattr(self.args, "hierarchical_fixed", False)) and self.args.prompt == "hierarchical"
+        fix_rope = hierarchical_fixed and not getattr(self.args, "no_hierarchical_fixed_rope", False)
+        if hierarchical_fixed and fix_rope:
+            print("[hierarchical_fixed] ROPE fix enabled: unrotate before fuse, rotate once for judger.", flush=True)
 
         for agent in self.agents:
 
@@ -177,7 +213,15 @@ class LatentMASMethod:
                     past_key_values=past_kv_input,
                 )
                 if hierarchical_fixed:
-                    non_judger_caches.append(past_kv)
+                    if fix_rope:
+                        legacy = self._to_legacy_tuple(past_kv)
+                        if legacy is not None:
+                            unrotated = self.model.unrotate_legacy_cache(legacy)
+                            non_judger_caches.append(unrotated if unrotated is not None else legacy)
+                        else:
+                            non_judger_caches.append(past_kv)
+                    else:
+                        non_judger_caches.append(past_kv)
                 elif self.sequential_info_only or self.latent_only:
                     new_past_len = _past_length(past_kv)
                     tokens_added = new_past_len - prev_past_len
@@ -199,9 +243,14 @@ class LatentMASMethod:
                         }
                     )
             else:
-                # Judger: in hierarchical_fixed mode, use fused caches from independent agents (no ROPE fix yet)
+                # Judger: in hierarchical_fixed mode, fuse caches; optionally rotate once for correct RoPE positions
                 if hierarchical_fixed and non_judger_caches:
-                    past_for_decoding = self._fuse_past_key_values(non_judger_caches)
+                    fused_legacy = self._fuse_past_key_values(non_judger_caches)
+                    if fix_rope and fused_legacy is not None:
+                        rotated = self.model.rotate_legacy_cache(fused_legacy, position_start=0)
+                        past_for_decoding = self._legacy_to_dynamic_cache(rotated if rotated is not None else fused_legacy)
+                    else:
+                        past_for_decoding = self._legacy_to_dynamic_cache(fused_legacy)
                 else:
                     past_for_decoding = past_kv if self.latent_steps > 0 else None
 

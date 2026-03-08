@@ -107,7 +107,9 @@ def main():
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
     parser.add_argument("--hierarchical_fixed", action="store_true",
-                        help="LatentMAS hierarchical: non-judger agents reason independently (no shared KV); judger sees fused caches. No ROPE fix in this mode.")
+                        help="LatentMAS hierarchical: non-judger agents reason independently (no shared KV); judger sees fused caches.")
+    parser.add_argument("--no_hierarchical_fixed_rope", action="store_true",
+                        help="Disable ROPE fix for hierarchical_fixed (default: apply unrotate->fuse->rotate).")
     parser.add_argument("--seed", type=int, default=42)
 
     # vLLM support
