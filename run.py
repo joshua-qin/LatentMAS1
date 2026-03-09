@@ -110,6 +110,8 @@ def main():
                         help="LatentMAS hierarchical: non-judger agents reason independently (no shared KV); judger sees fused caches.")
     parser.add_argument("--no_hierarchical_fixed_rope", action="store_true",
                         help="Disable ROPE fix for hierarchical_fixed (default: apply unrotate->fuse->rotate).")
+    parser.add_argument("--hierarchical_fixed_corrupt_cache", action="store_true",
+                        help="Ablation: shuffle fused KV cache along sequence dim so judger sees random order (expect bad accuracy).")
     parser.add_argument("--seed", type=int, default=42)
 
     # vLLM support

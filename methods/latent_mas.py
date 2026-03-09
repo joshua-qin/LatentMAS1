@@ -150,6 +150,21 @@ class LatentMASMethod:
             fused.append((fused_k, fused_v))
         return tuple(fused)
 
+    @staticmethod
+    def _shuffle_cache_seq(legacy_kv: Tuple, seed: int):
+        """Ablation: shuffle KV cache along sequence dim (same perm for K and V, all layers). Destroys order."""
+        if legacy_kv is None:
+            return None
+        generator = torch.Generator(device=legacy_kv[0][0].device).manual_seed(seed)
+        out = []
+        for k, v in legacy_kv:
+            seq_len = k.shape[-2]
+            perm = torch.randperm(seq_len, device=k.device, generator=generator)
+            k_shuf = k.index_select(-2, perm)
+            v_shuf = v.index_select(-2, perm)
+            out.append((k_shuf, v_shuf))
+        return tuple(out)
+
     @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:
         if len(items) > self.generate_bs:
@@ -248,9 +263,12 @@ class LatentMASMethod:
                     fused_legacy = self._fuse_past_key_values(non_judger_caches)
                     if fix_rope and fused_legacy is not None:
                         rotated = self.model.rotate_legacy_cache(fused_legacy, position_start=0)
-                        past_for_decoding = self._legacy_to_dynamic_cache(rotated if rotated is not None else fused_legacy)
-                    else:
-                        past_for_decoding = self._legacy_to_dynamic_cache(fused_legacy)
+                        fused_legacy = rotated if rotated is not None else fused_legacy
+                    if getattr(self.args, "hierarchical_fixed_corrupt_cache", False) and fused_legacy is not None:
+                        fused_legacy = self._shuffle_cache_seq(
+                            fused_legacy, seed=int(getattr(self.args, "seed", 42))
+                        )
+                    past_for_decoding = self._legacy_to_dynamic_cache(fused_legacy) if fused_legacy is not None else None
                 else:
                     past_for_decoding = past_kv if self.latent_steps > 0 else None
 
